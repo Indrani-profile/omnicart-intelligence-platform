@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# dbt
+dbt_project/target/
+dbt_project/dbt_packages/
+dbt_project/logs/
+target/
+dbt_packages/
+omnicart/target/
+omnicart/dbt_packages/
+.user.yml
+
+# Databricks
+.databricks/
+
+# Great Expectations
+quality/uncommitted/
+quality/.ge_store_backend_id
+
+# Streamlit
+dashboard/.streamlit/secrets.toml
+
+# Env / secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Logs
+logs/
+*.log
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/

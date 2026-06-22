@@ -19,10 +19,17 @@ locals {
   }
 }
 
+resource "azurerm_resource_group" "datalake" {
+  name     = var.resource_group_name
+  location = var.location
+
+  tags = local.tags
+}
+
 resource "azurerm_storage_account" "datalake" {
   name                     = var.storage_account_name
-  resource_group_name      = var.resource_group_name
-  location                 = var.location
+  resource_group_name      = azurerm_resource_group.datalake.name
+  location                 = azurerm_resource_group.datalake.location
   account_kind             = "StorageV2"
   account_tier             = "Standard"
   account_replication_type = "LRS"

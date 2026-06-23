@@ -21,3 +21,9 @@ variable "project_name" {
   type        = string
   default     = "omnicart"
 }
+
+variable "snowflake_password" {
+  description = "Snowflake service account password, stored in Key Vault (set via terraform.tfvars)"
+  type        = string
+  sensitive   = true
+}

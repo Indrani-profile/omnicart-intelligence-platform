@@ -5,6 +5,8 @@ import os
 import sys
 import tempfile
 
+import time
+
 import requests
 from azure.storage.blob import BlobServiceClient, ContentSettings
 
@@ -19,12 +21,14 @@ CATEGORIES = [
     "Electronics",
     "Sports_and_Outdoors",
 ]
+TMP_DIR        = os.path.expanduser("~/omnicart-intelligence-platform/tmp")
 CONTAINER_NAME = "raw"
 BLOB_PREFIX = "amazon"
 DOWNLOAD_CHUNK_SIZE = 1024 ** 2          # 1 MiB
 PROGRESS_LOG_INTERVAL = 50 * 1024 ** 2  # log every 50 MiB
 UPLOAD_BLOCK_SIZE = 4 * 1024 ** 2       # 4 MiB chunks
-MAX_DOWNLOAD_ATTEMPTS = 5
+MAX_DOWNLOAD_ATTEMPTS = 15
+MAX_UPLOAD_ATTEMPTS = 5
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logging.getLogger("azure").setLevel(logging.WARNING)
@@ -38,6 +42,9 @@ def human_size(num_bytes):
             return f"{size:.1f}{unit}"
         size /= 1024
     return f"{size:.1f}PB"
+
+
+os.makedirs(TMP_DIR, exist_ok=True)
 
 
 def get_blob_service_client():
@@ -72,7 +79,7 @@ def make_progress_logger(label, stage, total):
 def download_to_tempfile(url, expected_size, label):
     progress = make_progress_logger(label, "download", expected_size)
 
-    fd, tmp_path = tempfile.mkstemp(suffix=".jsonl", prefix="amazon_")
+    fd, tmp_path = tempfile.mkstemp(suffix=".jsonl", prefix="amazon_", dir=TMP_DIR)
     os.close(fd)
 
     written = 0
@@ -96,12 +103,37 @@ def download_to_tempfile(url, expected_size, label):
                         written += len(chunk)
                         progress(written)
         except requests.exceptions.RequestException as exc:
+            backoff = min(2 ** attempt, 60)
             logger.info(
-                "  ...%s download interrupted at %s, retrying (attempt %d/%d): %s",
-                label, human_size(written), attempt, MAX_DOWNLOAD_ATTEMPTS, exc,
+                "  ...%s download interrupted at %s, retrying in %ds (attempt %d/%d): %s",
+                label, human_size(written), backoff, attempt, MAX_DOWNLOAD_ATTEMPTS, exc,
             )
+            time.sleep(backoff)
 
     return tmp_path
+
+
+def upload_with_retry(blob_client, tmp_path, expected_size, label):
+    for attempt in range(1, MAX_UPLOAD_ATTEMPTS + 1):
+        try:
+            with open(tmp_path, "rb") as tmp_file:
+                blob_client.upload_blob(
+                    data=tmp_file,
+                    length=expected_size,
+                    overwrite=True,
+                    content_settings=ContentSettings(content_type="application/x-ndjson"),
+                    progress_hook=make_progress_logger(label, "upload", expected_size),
+                )
+            return
+        except Exception as exc:
+            if attempt >= MAX_UPLOAD_ATTEMPTS:
+                raise
+            backoff = min(2 ** attempt, 60)
+            logger.info(
+                "  ...%s upload failed, retrying in %ds (attempt %d/%d): %s",
+                label, backoff, attempt, MAX_UPLOAD_ATTEMPTS, exc,
+            )
+            time.sleep(backoff)
 
 
 def process_category(blob_service_client, category):
@@ -125,18 +157,9 @@ def process_category(blob_service_client, category):
     logger.info("Downloading %s (%s)", file_name, human_size(expected_size))
     tmp_path = download_to_tempfile(url, expected_size, file_name)
 
-    try:
-        logger.info("Uploading %s -> %s/%s", file_name, CONTAINER_NAME, blob_name)
-        with open(tmp_path, "rb") as tmp_file:
-            blob_client.upload_blob(
-                data=tmp_file,
-                length=expected_size,
-                overwrite=True,
-                content_settings=ContentSettings(content_type="application/x-ndjson"),
-                progress_hook=make_progress_logger(file_name, "upload", expected_size),
-            )
-    finally:
-        os.remove(tmp_path)
+    logger.info("Uploading %s -> %s/%s", file_name, CONTAINER_NAME, blob_name)
+    upload_with_retry(blob_client, tmp_path, expected_size, file_name)
+    os.remove(tmp_path)
 
     logger.info("Done: %s (%s)", file_name, human_size(expected_size))
     return True

@@ -1,6 +1,6 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # TLC Yellow Taxi — Bronze Ingestion (Auto Loader)
+# MAGIC # TLC Yellow Taxi — Bronze Ingestion (Batch, per-file read + union)
 # MAGIC
 # MAGIC | | |
 # MAGIC |---|---|
@@ -11,221 +11,162 @@
 # MAGIC
 # MAGIC **Sections**
 # MAGIC
-# MAGIC 1. **Config** — path constants and Auto Loader options.
-# MAGIC 2. **Read stream** — Auto Loader (`cloudFiles`) reads parquet files
-# MAGIC    incrementally, against an **explicit schema** (see note below)
-# MAGIC    rather than inferring one.
-# MAGIC 3. **Transform** — two audit columns are appended to every row:
-# MAGIC    `_source_file` (the ABFSS path of the originating file) and
-# MAGIC    `_ingested_at` (wall-clock timestamp of the ingestion micro-batch).
-# MAGIC    These columns make lineage traceable back to the exact source file
-# MAGIC    without touching any upstream data.
-# MAGIC 4. **Write stream** — appends enriched rows to the Delta table at the
-# MAGIC    target path. `trigger(availableNow=True)` drains all files not yet
-# MAGIC    seen by the checkpoint, then stops the stream. Re-running the
-# MAGIC    notebook is safe: Auto Loader's checkpoint prevents any file from
-# MAGIC    being re-ingested.
-# MAGIC 5. **Verify** — queries the Delta table for a row count so the operator
-# MAGIC    can confirm data landed correctly before declaring the run complete.
-# MAGIC 6. **Full reprocess (destructive, manual)** — drops the existing
-# MAGIC    `bronze_tlc_deliveries` table, checkpoint, and schema location so
-# MAGIC    the notebook can be re-run top to bottom against the fixed schema.
-# MAGIC 7. **Post-reprocess check** — per-month null rate for `VendorID` /
-# MAGIC    `PULocationID`, to confirm all 12 months populated correctly.
+# MAGIC 1. **Config** — path constants.
+# MAGIC 2. **Discover files** — list the monthly parquet files under
+# MAGIC    `SOURCE_PATH`.
+# MAGIC 3. **Read + cast, per file** — each file is read on its own so Spark
+# MAGIC    infers *that file's* own correct native schema (no cross-file
+# MAGIC    type conflict is possible when only one file is involved), then
+# MAGIC    the four ID columns are cast to `LongType` within that file's
+# MAGIC    DataFrame using Spark's own `.cast()` — which freely handles
+# MAGIC    Long↔Double, unlike the Parquet reader.
+# MAGIC 4. **Union** — all 12 per-file DataFrames are combined with
+# MAGIC    `unionByName(allowMissingColumns=True)` (the `allowMissingColumns`
+# MAGIC    handles `congestion_surcharge`/`airport_fee` being absent from
+# MAGIC    some early-2023 files).
+# MAGIC 5. **Transform** — two audit columns appended to every row:
+# MAGIC    `_source_file` (from the hidden `_metadata.file_path` column) and
+# MAGIC    `_ingested_at` (wall-clock time of this run).
+# MAGIC 6. **Write (batch, overwrite)** — a full overwrite of the Delta table
+# MAGIC    at the target path. Safe here because this is a one-time load of
+# MAGIC    12 static files, not an ongoing incremental feed.
+# MAGIC 7. **Verify** — row count check.
+# MAGIC 8. **Post-load check** — per-month null rate for `VendorID` /
+# MAGIC    `PULocationID`, to confirm all 12 months are populated correctly.
 # MAGIC
-# MAGIC **Root cause note (Session 3.1c)** — Auto Loader's schema inference
-# MAGIC locked onto the casing of the first-processed file (January 2023).
-# MAGIC 11 of the 12 monthly TLC files use slightly different column-name
-# MAGIC casing (e.g. `Airport_fee` vs `airport_fee`), so those columns failed
-# MAGIC to match the locked schema and were rescued into `_rescued_data`
-# MAGIC instead of populating the real typed columns — ~92% of rows ended up
-# MAGIC null for `vendor_id`, `passenger_count`, `rate_code_id`,
-# MAGIC `pickup_location_id`, `dropoff_location_id`. The fix below reads
-# MAGIC against an explicit schema instead of an inferred one; Spark's column
-# MAGIC resolution is case-insensitive by default
-# MAGIC (`spark.sql.caseSensitive` = `false`), so every differently-cased
-# MAGIC variant of a column now maps onto the same logical field regardless
-# MAGIC of which file it came from.
+# MAGIC **Session 2.3 history** — this notebook went through five rounds of
+# MAGIC fixes against the same underlying problem: the 12 monthly TLC files
+# MAGIC are not schema-consistent with each other.
+# MAGIC 1. Auto Loader's inferred schema locked onto January's column-name
+# MAGIC    casing, rescuing 11 months' worth of differently-cased columns
+# MAGIC    into `_rescued_data` (~92% null on the affected columns) — fixed
+# MAGIC    with an explicit schema so case-insensitive resolution applied.
+# MAGIC 2. That surfaced `passenger_count` stored as INT64 in some months
+# MAGIC    against a declared `DoubleType` — fixed by disabling the
+# MAGIC    vectorized Parquet reader (row-based reader tolerates the
+# MAGIC    INT64→DOUBLE widening).
+# MAGIC 3. That surfaced the reverse: `VendorID`/`PULocationID`/
+# MAGIC    `DOLocationID` stored as DOUBLE in some months against a declared
+# MAGIC    `LongType` — fixed by declaring every numeric field as
+# MAGIC    `DoubleType` (the one universally-safe widening target) and
+# MAGIC    casting the ID columns back to `LongType` afterward.
+# MAGIC 4. Even with an all-`DoubleType` schema, the same
+# MAGIC    `ClassCastException` (`MutableDouble` cannot be cast to
+# MAGIC    `MutableLong`) recurred on `2023-10`, confirmed via a fresh query
+# MAGIC    ID (not stale state) — a genuine Parquet-reader limitation, not
+# MAGIC    something fixable via further schema declarations.
+# MAGIC 5. A batch `mergeSchema=true` read was considered next, but ruled
+# MAGIC    out before implementation: Spark's Parquet schema merge only
+# MAGIC    reconciles differing *sets* of columns across files (schema
+# MAGIC    evolution) and `NullType`/decimal-precision widening — it does
+# MAGIC    **not** reconcile two files genuinely disagreeing on a column's
+# MAGIC    primitive type (e.g. `LongType` vs `DoubleType`), and would have
+# MAGIC    thrown `Failed to merge incompatible data types` at read time,
+# MAGIC    the same underlying conflict resurfacing as a different error.
+# MAGIC
+# MAGIC **This step (part 5)** reads each of the 12 files individually so
+# MAGIC every file is read at its own correct native type with zero reader-
+# MAGIC level coercion, casts the ID columns using Spark's own `.cast()`
+# MAGIC (unrestricted, unlike the Parquet reader) within each per-file
+# MAGIC DataFrame, and unions the results — the Parquet reader is never
+# MAGIC asked to reconcile two conflicting physical types in a single read.
 
 # COMMAND ----------
 
 # ── 1. Config ─────────────────────────────────────────────────────────────────
 # ADLS auth is configured at the cluster level via the omnicart-kv Key Vault
 # secret scope (set up in Session 1.3); no explicit credentials are needed here.
+# No checkpoint or schema-inference location is needed — those are Auto
+# Loader/streaming concepts that don't apply to a plain batch read.
 
-SOURCE_PATH     = "abfss://raw@omnicartdatalake.dfs.core.windows.net/tlc/"
-TARGET_PATH     = "abfss://bronze@omnicartdatalake.dfs.core.windows.net/bronze_tlc_deliveries/"
-CHECKPOINT_PATH = "abfss://bronze@omnicartdatalake.dfs.core.windows.net/checkpoints/tlc/"
-SCHEMA_PATH     = "abfss://bronze@omnicartdatalake.dfs.core.windows.net/schemas/tlc/"
+SOURCE_PATH = "abfss://raw@omnicartdatalake.dfs.core.windows.net/tlc/"
+TARGET_PATH = "abfss://bronze@omnicartdatalake.dfs.core.windows.net/bronze_tlc_deliveries/"
 
 # COMMAND ----------
 
-# ── 2. Read stream (Auto Loader, explicit schema) ─────────────────────────────
-# An explicit schema replaces inferColumnTypes so that Auto Loader never
-# locks onto the casing of whichever file happens to be processed first.
-# Field names below match the January 2023 file (the shape every downstream
-# notebook already expects); Spark's default case-insensitive column
-# resolution maps every other month's casing variants onto these same
-# fields instead of routing them to _rescued_data.
+# ── 2. Discover files ──────────────────────────────────────────────────────────
+source_files = sorted(
+    [f.path for f in dbutils.fs.ls(SOURCE_PATH) if f.path.endswith(".parquet")]
+)
+
+print(f"Discovered {len(source_files)} parquet files under {SOURCE_PATH}")
+for path in source_files:
+    print(f"  {path}")
+
+# COMMAND ----------
+
+# ── 3. Read + cast, per file ───────────────────────────────────────────────────
+# Each file is read on its own so Spark infers that file's own correct
+# native schema — with only one file involved there's no cross-file type
+# conflict for the reader to hit. VendorID/PULocationID/DOLocationID/
+# payment_type are cast to LongType immediately, using Spark's own .cast()
+# (which freely handles Long<->Double), regardless of which numeric type
+# that particular file's inference produced.
 from pyspark.sql import functions as F
-from pyspark.sql.types import (
-    StructType,
-    StructField,
-    LongType,
-    DoubleType,
-    StringType,
-    TimestampType,
-)
+from pyspark.sql.types import LongType
+from functools import reduce
 
-# VendorID, PULocationID, DOLocationID, and payment_type are declared as
-# DoubleType here instead of their "real" integer type. Source files store
-# these inconsistently as INT32/INT64/DOUBLE across the 12 months, and
-# DOUBLE is the one target type every one of those physical types can
-# safely widen into — LongType as a target fails outright for any month
-# where the physical column is DOUBLE (narrowing isn't supported by
-# either Parquet reader path). They're cast back to LongType explicitly
-# in the "Add audit columns" step below, once Spark controls the cast
-# instead of the Parquet reader.
-TLC_SCHEMA = StructType([
-    StructField("VendorID", DoubleType(), True),
-    StructField("tpep_pickup_datetime", TimestampType(), True),
-    StructField("tpep_dropoff_datetime", TimestampType(), True),
-    StructField("passenger_count", DoubleType(), True),
-    StructField("trip_distance", DoubleType(), True),
-    StructField("RatecodeID", DoubleType(), True),
-    StructField("store_and_fwd_flag", StringType(), True),
-    StructField("PULocationID", DoubleType(), True),
-    StructField("DOLocationID", DoubleType(), True),
-    StructField("payment_type", DoubleType(), True),
-    StructField("fare_amount", DoubleType(), True),
-    StructField("extra", DoubleType(), True),
-    StructField("mta_tax", DoubleType(), True),
-    StructField("tip_amount", DoubleType(), True),
-    StructField("tolls_amount", DoubleType(), True),
-    StructField("improvement_surcharge", DoubleType(), True),
-    StructField("total_amount", DoubleType(), True),
-    StructField("congestion_surcharge", DoubleType(), True),
-    StructField("airport_fee", DoubleType(), True),
-])
+ID_COLUMNS = ["VendorID", "PULocationID", "DOLocationID", "payment_type"]
 
-# Every numeric field in TLC_SCHEMA is DoubleType (including VendorID,
-# PULocationID, DOLocationID, and payment_type, which are really integer
-# IDs — see the note above) because the 12 monthly source files store
-# these columns inconsistently as INT32/INT64/DOUBLE, and DOUBLE is the
-# one target every one of those physical types can safely widen into.
-# Spark's vectorized Parquet reader reads columns as fixed-width batches
-# matching the physical type and won't perform that widening (e.g.
-# INT64 -> DOUBLE), raising SchemaColumnConvertNotSupportedException. The
-# row-based reader does support it, so we trade a bit of read speed
-# (acceptable at this data volume — ~540MB, 38.3M rows) for correctness
-# across all 12 months. This is a reader-level setting, so it covers
-# every DoubleType column in TLC_SCHEMA, not just passenger_count — still
-# required now that VendorID/PULocationID/DOLocationID/payment_type are
-# DoubleType too.
-spark.conf.set("spark.sql.parquet.enableVectorizedReader", "false")
+per_file_dfs = []
+for path in source_files:
+    file_df = spark.read.parquet(path)
+    for col_name in ID_COLUMNS:
+        file_df = file_df.withColumn(col_name, F.col(col_name).cast(LongType()))
+    row_count = file_df.count()
+    print(f"Read {path} — {row_count:,} rows")
+    per_file_dfs.append(file_df)
 
-raw_stream = (
-    spark.readStream
-        .format("cloudFiles")
-        .option("cloudFiles.format", "parquet")
-        .option("cloudFiles.schemaLocation", SCHEMA_PATH)
-        .schema(TLC_SCHEMA)
-        .load(SOURCE_PATH)
+# COMMAND ----------
+
+# ── 4. Union all files ─────────────────────────────────────────────────────────
+# allowMissingColumns=True handles congestion_surcharge/airport_fee being
+# absent from some early-2023 files — missing columns are filled with null.
+unioned_df = reduce(
+    lambda left, right: left.unionByName(right, allowMissingColumns=True),
+    per_file_dfs,
 )
 
 # COMMAND ----------
 
-# ── 3. Add audit columns ──────────────────────────────────────────────────────
-# VendorID/PULocationID/DOLocationID/payment_type were read as DoubleType
-# (see the note on TLC_SCHEMA above) to dodge Parquet's narrowing
-# restriction; cast them back to LongType here, in Spark, now that the
-# values are already safely in memory as doubles.
-enriched_stream = (
-    raw_stream
-        .withColumn("VendorID", F.col("VendorID").cast(LongType()))
-        .withColumn("PULocationID", F.col("PULocationID").cast(LongType()))
-        .withColumn("DOLocationID", F.col("DOLocationID").cast(LongType()))
-        .withColumn("payment_type", F.col("payment_type").cast(LongType()))
+# ── 5. Add audit columns ──────────────────────────────────────────────────────
+enriched_df = (
+    unioned_df
         .withColumn("_source_file", F.col("_metadata.file_path"))
         .withColumn("_ingested_at", F.current_timestamp())
 )
 
 # COMMAND ----------
 
-# ── 4. Write stream → Delta (append, availableNow) ────────────────────────────
-write_query = (
-    enriched_stream.writeStream
+# ── 6. Write (batch, overwrite) ───────────────────────────────────────────────
+# overwrite is correct here: this is a full reprocess of a static 12-file
+# dataset, not an incremental append scenario. overwriteSchema handles the
+# target table's schema having changed across the earlier (streaming)
+# attempts at this fix.
+(
+    enriched_df.write
         .format("delta")
-        .outputMode("append")
-        .option("checkpointLocation", CHECKPOINT_PATH)
-        .trigger(availableNow=True)
-        .start(TARGET_PATH)
+        .mode("overwrite")
+        .option("overwriteSchema", "true")
+        .save(TARGET_PATH)
 )
 
-write_query.awaitTermination()
-print(f"Ingestion complete — final status: {write_query.status}")
+print("Batch ingestion complete.")
 
 # COMMAND ----------
 
-# ── 5. Verify row count ───────────────────────────────────────────────────────
+# ── 7. Verify row count ───────────────────────────────────────────────────────
 display(spark.sql(f"SELECT COUNT(*) AS row_count FROM delta.`{TARGET_PATH}`"))
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC ## 6. Full reprocess (destructive — manual confirmation required)
-# MAGIC
-# MAGIC The existing `bronze_tlc_deliveries` table, its checkpoint, and its
-# MAGIC schema location were all built under the old case-sensitive inferred
-# MAGIC schema — 11 of 12 months are sitting in there with the real columns
-# MAGIC null and the data stuck in `_rescued_data`. Re-running the notebook
-# MAGIC as-is will NOT fix this: the checkpoint has already marked every file
-# MAGIC as processed, so Auto Loader will skip them all on the next run.
-# MAGIC
-# MAGIC A full reprocess means: drop the Delta table data, delete the
-# MAGIC checkpoint directory, delete the schema location, then re-run this
-# MAGIC notebook top to bottom so Auto Loader treats all 12 months as new.
-# MAGIC
-# MAGIC **This deletes `bronze_tlc_deliveries` and cannot be undone.**
-# MAGIC `CONFIRM_REPROCESS` defaults to `False` — flip it to `True` only after
-# MAGIC you've confirmed it's safe to wipe the table, then run this cell,
-# MAGIC then re-run cells 1-5 above.
-# MAGIC
-# MAGIC Nothing in this repo registers `bronze_tlc_deliveries` as a Unity
-# MAGIC Catalog table (no `CREATE TABLE ... USING DELTA LOCATION` anywhere in
-# MAGIC `databricks/`) — both bronze and silver only ever address it by path.
-# MAGIC The `DROP TABLE IF EXISTS` below is a no-op if that holds in the
-# MAGIC workspace too; it only matters if the table was registered manually
-# MAGIC or by something outside this repo.
-# MAGIC
-# MAGIC Reprocessing also takes noticeably longer than the original bronze
-# MAGIC run: with the checkpoint cleared, Auto Loader has no incremental
-# MAGIC skip and reads all 12 months fresh (~540MB, 38.3M rows) instead of
-# MAGIC picking up only new files.
+# ── 8. Post-load check — per-month null rate for VendorID/PULocationID ───────
+# Confirms all 12 months are populated evenly (i.e. no month shows an
+# elevated null rate vs. the others).
+post_load_df = spark.read.format("delta").load(TARGET_PATH)
 
-# COMMAND ----------
-
-CONFIRM_REPROCESS = False  # set to True only after confirming it's safe to wipe bronze_tlc_deliveries
-
-if CONFIRM_REPROCESS:
-    spark.sql("DROP TABLE IF EXISTS bronze_tlc_deliveries")
-    dbutils.fs.rm(TARGET_PATH, recurse=True)
-    dbutils.fs.rm(CHECKPOINT_PATH, recurse=True)
-    dbutils.fs.rm(SCHEMA_PATH, recurse=True)
-    print("Dropped bronze_tlc_deliveries (catalog entry, if any, data, checkpoint, and schema location).")
-    print("Now re-run cells 1-5 above to reprocess all 12 months with the fixed schema.")
-else:
-    print("CONFIRM_REPROCESS is False — nothing was dropped. Flip to True to proceed.")
-
-# COMMAND ----------
-
-# ── 7. Post-reprocess check — per-month null rate for VendorID/PULocationID ──
-# Run this after the full reprocess completes to confirm all 12 months are
-# now populated (i.e. no month shows an elevated null rate vs. the others).
-post_reprocess_df = spark.read.format("delta").load(TARGET_PATH)
-
-post_reprocess_monthly = (
-    post_reprocess_df
+post_load_monthly = (
+    post_load_df
         .withColumn("_source_month", F.regexp_extract(F.col("_source_file"), r"(\d{4}-\d{2})", 1))
         .groupBy("_source_month")
         .agg(
@@ -238,4 +179,4 @@ post_reprocess_monthly = (
         .orderBy("_source_month")
 )
 
-display(post_reprocess_monthly)
+display(post_load_monthly)

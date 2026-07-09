@@ -1,6 +1,6 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # TLC Yellow Taxi — Bronze → Silver (Step 1: Read, Rename, Cast)
+# MAGIC # TLC Yellow Taxi — Bronze → Silver (Step 1: Read, Rename)
 # MAGIC
 # MAGIC | | |
 # MAGIC |---|---|
@@ -14,19 +14,30 @@
 # MAGIC    Key Vault secret scope so subsequent ABFSS paths resolve without
 # MAGIC    needing cluster-level credentials.
 # MAGIC 2. **Config** — path constants for the bronze and silver containers.
-# MAGIC 3. **Read** — loads the `bronze_tlc_deliveries` Delta table.
+# MAGIC 3. **Read** — loads the `bronze_tlc_deliveries` Delta table (plain
+# MAGIC    batch read; bronze itself is no longer a streaming/Auto Loader
+# MAGIC    table — see Session 2.3's history comments in
+# MAGIC    `databricks/bronze/tlc_bronze.py`).
 # MAGIC 4. **Rename** — maps raw TLC column names onto a delivery-framing
 # MAGIC    vocabulary (`pickup_ts`, `dropoff_ts`, `trip_distance_miles`, etc.).
-# MAGIC 5. **Backfill missing columns** — `congestion_surcharge` and
-# MAGIC    `airport_fee` are absent from some early-2023 source months; add
-# MAGIC    them as null `DoubleType` columns when missing so the schema is
-# MAGIC    stable across the whole table.
-# MAGIC 6. **Cast** — casts every column to its correct type.
-# MAGIC 7. **Preview** — prints the bronze row count and displays a sample so
-# MAGIC    the renamed/typed schema can be checked before validity rules are
-# MAGIC    added in the next step.
+# MAGIC    `_source_file`/`_ingested_at` (bronze audit columns) pass through
+# MAGIC    unchanged.
+# MAGIC 5. **Preview** — prints the bronze row count and displays a sample so
+# MAGIC    the renamed schema can be checked before validity rules are added
+# MAGIC    in the next step.
 # MAGIC
-# MAGIC **Note** — this step only reads, renames, and casts. No null handling,
+# MAGIC **Note (Session 3.1a retry)** — this is a rewrite against the
+# MAGIC reprocessed bronze table (38,310,226 rows, confirmed 0% nulls on
+# MAGIC `VendorID`/`PULocationID` across all 12 months). The previous version
+# MAGIC of this notebook was built against the pre-fix bronze data and
+# MAGIC included a cast step and a null-column backfill that no longer apply:
+# MAGIC bronze already stores `VendorID`/`PULocationID`/`DOLocationID`/
+# MAGIC `payment_type` as correct `LongType`, and its per-file
+# MAGIC `unionByName(allowMissingColumns=True)` already guarantees
+# MAGIC `congestion_surcharge`/`airport_fee` exist (nulled where the source
+# MAGIC month didn't have them) for every row in the table.
+# MAGIC
+# MAGIC **This step only reads and renames.** No casting, null handling,
 # MAGIC dedup, or write to the silver container yet.
 
 # COMMAND ----------
@@ -45,15 +56,16 @@ SILVER_PATH = "abfss://silver@omnicartdatalake.dfs.core.windows.net/"
 
 # COMMAND ----------
 
-# ── 3. Read bronze Delta table ────────────────────────────────────────────────
+# ── 3. Read bronze Delta table (batch) ────────────────────────────────────────
 from pyspark.sql import functions as F
-from pyspark.sql.types import DoubleType
 
 bronze_df = spark.read.format("delta").load(BRONZE_PATH + "bronze_tlc_deliveries")
 
 # COMMAND ----------
 
 # ── 4. Rename columns to delivery-framing vocabulary ──────────────────────────
+# _source_file and _ingested_at are bronze audit columns and pass through
+# unchanged (not part of this map).
 RENAME_MAP = {
     "VendorID": "vendor_id",
     "tpep_pickup_datetime": "pickup_ts",
@@ -76,51 +88,13 @@ RENAME_MAP = {
     "airport_fee": "airport_fee",
 }
 
-renamed_df = bronze_df
+silver_df = bronze_df
 for source_col, target_col in RENAME_MAP.items():
-    if source_col in renamed_df.columns:
-        renamed_df = renamed_df.withColumnRenamed(source_col, target_col)
+    if source_col in silver_df.columns:
+        silver_df = silver_df.withColumnRenamed(source_col, target_col)
 
 # COMMAND ----------
 
-# ── 5. Backfill columns missing from early-2023 source months ────────────────
-for optional_col in ("congestion_surcharge", "airport_fee"):
-    if optional_col not in renamed_df.columns:
-        renamed_df = renamed_df.withColumn(
-            optional_col, F.lit(None).cast(DoubleType())
-        )
-
-# COMMAND ----------
-
-# ── 6. Cast columns to correct types ──────────────────────────────────────────
-CAST_MAP = {
-    "vendor_id": "int",
-    "pickup_ts": "timestamp",
-    "dropoff_ts": "timestamp",
-    "passenger_count": "int",
-    "trip_distance_miles": "double",
-    "rate_code_id": "int",
-    "store_and_fwd_flag": "string",
-    "pickup_location_id": "int",
-    "dropoff_location_id": "int",
-    "payment_type_id": "int",
-    "fare_amount": "double",
-    "extra": "double",
-    "mta_tax": "double",
-    "tip_amount": "double",
-    "tolls_amount": "double",
-    "improvement_surcharge": "double",
-    "total_amount": "double",
-    "congestion_surcharge": "double",
-    "airport_fee": "double",
-}
-
-silver_df = renamed_df
-for col_name, target_type in CAST_MAP.items():
-    silver_df = silver_df.withColumn(col_name, F.col(col_name).cast(target_type))
-
-# COMMAND ----------
-
-# ── 7. Preview renamed/typed schema ───────────────────────────────────────────
+# ── 5. Preview renamed schema ──────────────────────────────────────────────────
 print(f"Bronze row count: {bronze_df.count()}")
 display(silver_df.limit(20))

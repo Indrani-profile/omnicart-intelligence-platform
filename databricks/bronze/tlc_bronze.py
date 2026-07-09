@@ -99,6 +99,19 @@ TLC_SCHEMA = StructType([
     StructField("airport_fee", DoubleType(), True),
 ])
 
+# Some monthly TLC files store a DoubleType field (e.g. passenger_count,
+# RatecodeID, congestion_surcharge, airport_fee) as physical INT64 instead
+# of DOUBLE, likely because every value in that month's file happened to be
+# a whole number and the parquet writer picked the narrower type. Spark's
+# vectorized Parquet reader reads columns as fixed-width batches matching
+# the physical type and won't safely widen INT64 -> DOUBLE, raising
+# SchemaColumnConvertNotSupportedException. The row-based reader does
+# support that coercion, so we trade a bit of read speed (acceptable at
+# this data volume — ~540MB, 38.3M rows) for correctness across all 12
+# months. This is a reader-level setting, so it covers every DoubleType
+# column in TLC_SCHEMA, not just passenger_count.
+spark.conf.set("spark.sql.parquet.enableVectorizedReader", "false")
+
 raw_stream = (
     spark.readStream
         .format("cloudFiles")
@@ -113,7 +126,7 @@ raw_stream = (
 # ── 3. Add audit columns ──────────────────────────────────────────────────────
 enriched_stream = (
     raw_stream
-        .withColumn("_source_file", F.input_file_name())
+        .withColumn("_source_file", F.col("_metadata.file_path"))
         .withColumn("_ingested_at", F.current_timestamp())
 )
 

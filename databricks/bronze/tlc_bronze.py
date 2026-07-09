@@ -77,17 +77,26 @@ from pyspark.sql.types import (
     TimestampType,
 )
 
+# VendorID, PULocationID, DOLocationID, and payment_type are declared as
+# DoubleType here instead of their "real" integer type. Source files store
+# these inconsistently as INT32/INT64/DOUBLE across the 12 months, and
+# DOUBLE is the one target type every one of those physical types can
+# safely widen into — LongType as a target fails outright for any month
+# where the physical column is DOUBLE (narrowing isn't supported by
+# either Parquet reader path). They're cast back to LongType explicitly
+# in the "Add audit columns" step below, once Spark controls the cast
+# instead of the Parquet reader.
 TLC_SCHEMA = StructType([
-    StructField("VendorID", LongType(), True),
+    StructField("VendorID", DoubleType(), True),
     StructField("tpep_pickup_datetime", TimestampType(), True),
     StructField("tpep_dropoff_datetime", TimestampType(), True),
     StructField("passenger_count", DoubleType(), True),
     StructField("trip_distance", DoubleType(), True),
     StructField("RatecodeID", DoubleType(), True),
     StructField("store_and_fwd_flag", StringType(), True),
-    StructField("PULocationID", LongType(), True),
-    StructField("DOLocationID", LongType(), True),
-    StructField("payment_type", LongType(), True),
+    StructField("PULocationID", DoubleType(), True),
+    StructField("DOLocationID", DoubleType(), True),
+    StructField("payment_type", DoubleType(), True),
     StructField("fare_amount", DoubleType(), True),
     StructField("extra", DoubleType(), True),
     StructField("mta_tax", DoubleType(), True),
@@ -99,17 +108,20 @@ TLC_SCHEMA = StructType([
     StructField("airport_fee", DoubleType(), True),
 ])
 
-# Some monthly TLC files store a DoubleType field (e.g. passenger_count,
-# RatecodeID, congestion_surcharge, airport_fee) as physical INT64 instead
-# of DOUBLE, likely because every value in that month's file happened to be
-# a whole number and the parquet writer picked the narrower type. Spark's
-# vectorized Parquet reader reads columns as fixed-width batches matching
-# the physical type and won't safely widen INT64 -> DOUBLE, raising
-# SchemaColumnConvertNotSupportedException. The row-based reader does
-# support that coercion, so we trade a bit of read speed (acceptable at
-# this data volume — ~540MB, 38.3M rows) for correctness across all 12
-# months. This is a reader-level setting, so it covers every DoubleType
-# column in TLC_SCHEMA, not just passenger_count.
+# Every numeric field in TLC_SCHEMA is DoubleType (including VendorID,
+# PULocationID, DOLocationID, and payment_type, which are really integer
+# IDs — see the note above) because the 12 monthly source files store
+# these columns inconsistently as INT32/INT64/DOUBLE, and DOUBLE is the
+# one target every one of those physical types can safely widen into.
+# Spark's vectorized Parquet reader reads columns as fixed-width batches
+# matching the physical type and won't perform that widening (e.g.
+# INT64 -> DOUBLE), raising SchemaColumnConvertNotSupportedException. The
+# row-based reader does support it, so we trade a bit of read speed
+# (acceptable at this data volume — ~540MB, 38.3M rows) for correctness
+# across all 12 months. This is a reader-level setting, so it covers
+# every DoubleType column in TLC_SCHEMA, not just passenger_count — still
+# required now that VendorID/PULocationID/DOLocationID/payment_type are
+# DoubleType too.
 spark.conf.set("spark.sql.parquet.enableVectorizedReader", "false")
 
 raw_stream = (
@@ -124,8 +136,16 @@ raw_stream = (
 # COMMAND ----------
 
 # ── 3. Add audit columns ──────────────────────────────────────────────────────
+# VendorID/PULocationID/DOLocationID/payment_type were read as DoubleType
+# (see the note on TLC_SCHEMA above) to dodge Parquet's narrowing
+# restriction; cast them back to LongType here, in Spark, now that the
+# values are already safely in memory as doubles.
 enriched_stream = (
     raw_stream
+        .withColumn("VendorID", F.col("VendorID").cast(LongType()))
+        .withColumn("PULocationID", F.col("PULocationID").cast(LongType()))
+        .withColumn("DOLocationID", F.col("DOLocationID").cast(LongType()))
+        .withColumn("payment_type", F.col("payment_type").cast(LongType()))
         .withColumn("_source_file", F.col("_metadata.file_path"))
         .withColumn("_ingested_at", F.current_timestamp())
 )

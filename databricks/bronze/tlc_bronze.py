@@ -102,17 +102,31 @@ for path in source_files:
 # payment_type are cast to LongType immediately, using Spark's own .cast()
 # (which freely handles Long<->Double), regardless of which numeric type
 # that particular file's inference produced.
+#
+# tpep_pickup_datetime/tpep_dropoff_datetime are also cast explicitly to
+# TimestampType. Spark infers these as timestamp_ntz (timestamp without
+# timezone) from the source parquet, and Delta requires that table feature
+# to be manually enabled before it'll accept the column as-is. Casting to
+# plain TimestampType avoids needing that feature at all, and matches what
+# downstream silver/dbt models already expect from a "timestamp" column.
 from pyspark.sql import functions as F
-from pyspark.sql.types import LongType
+from pyspark.sql.types import LongType, TimestampType
 from functools import reduce
 
 ID_COLUMNS = ["VendorID", "PULocationID", "DOLocationID", "payment_type"]
+TIMESTAMP_COLUMNS = ["tpep_pickup_datetime", "tpep_dropoff_datetime"]
 
 per_file_dfs = []
 for path in source_files:
     file_df = spark.read.parquet(path)
     for col_name in ID_COLUMNS:
         file_df = file_df.withColumn(col_name, F.col(col_name).cast(LongType()))
+    for col_name in TIMESTAMP_COLUMNS:
+        file_df = file_df.withColumn(col_name, F.col(col_name).cast(TimestampType()))
+    # _metadata is a per-scan synthetic column tied to this file's own read;
+    # it must be captured here, before unionByName combines the 12 per-file
+    # DataFrames — referencing it after the union doesn't resolve.
+    file_df = file_df.withColumn("_source_file", F.col("_metadata.file_path"))
     row_count = file_df.count()
     print(f"Read {path} — {row_count:,} rows")
     per_file_dfs.append(file_df)
@@ -130,11 +144,9 @@ unioned_df = reduce(
 # COMMAND ----------
 
 # ── 5. Add audit columns ──────────────────────────────────────────────────────
-enriched_df = (
-    unioned_df
-        .withColumn("_source_file", F.col("_metadata.file_path"))
-        .withColumn("_ingested_at", F.current_timestamp())
-)
+# _source_file is already set per-file in section 3. current_timestamp()
+# doesn't depend on any per-file context, so it's fine to add post-union.
+enriched_df = unioned_df.withColumn("_ingested_at", F.current_timestamp())
 
 # COMMAND ----------
 

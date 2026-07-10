@@ -1,11 +1,13 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # TLC Yellow Taxi — Bronze → Silver (Steps 1-2: Read, Rename, Validate, Dedup)
+# MAGIC # TLC Yellow Taxi — Bronze → Silver (Read, Rename, Validate, Dedup, Write)
 # MAGIC
 # MAGIC | | |
 # MAGIC |---|---|
 # MAGIC | **Source** | `abfss://bronze@omnicartdatalake.dfs.core.windows.net/bronze_tlc_deliveries/` |
-# MAGIC | **Table** | `bronze_tlc_deliveries` (Delta) |
+# MAGIC | **Target** | `abfss://silver@omnicartdatalake.dfs.core.windows.net/tlc_deliveries/` |
+# MAGIC | **Rejects** | `abfss://silver@omnicartdatalake.dfs.core.windows.net/_rejects/tlc_deliveries/` |
+# MAGIC | **Table** | `silver_tlc_deliveries` (Delta) |
 # MAGIC | **Runtime** | Databricks 17.3 / Spark 4.0 — Unity Catalog enabled |
 # MAGIC
 # MAGIC **Sections**
@@ -37,6 +39,17 @@
 # MAGIC    keeping the row with the most recent `_ingested_at` per group.
 # MAGIC 9. **Summary** — prints bronze row count, valid row count, rejected
 # MAGIC    row count, and reject rate, to sanity-check the validity rules.
+# MAGIC 10. **Write valid** — writes `valid_df` to
+# MAGIC     `SILVER_PATH + "tlc_deliveries"` as Delta, batch overwrite,
+# MAGIC     partitioned by `pickup_date`.
+# MAGIC 11. **Write rejects** — writes `rejected_df` to
+# MAGIC     `SILVER_PATH + "_rejects/tlc_deliveries"` as Delta, batch
+# MAGIC     overwrite, unpartitioned — kept for auditing/debugging, not for
+# MAGIC     downstream consumption.
+# MAGIC 12. **Register table** — `CREATE TABLE IF NOT EXISTS
+# MAGIC     silver_tlc_deliveries USING DELTA LOCATION ...` against the
+# MAGIC     valid-data path.
+# MAGIC 13. **Confirm** — prints the row count written to `silver_tlc_deliveries`.
 # MAGIC
 # MAGIC **Note (Session 3.1a retry)** — this is a rewrite against the
 # MAGIC reprocessed bronze table (38,310,226 rows, confirmed 0% nulls on
@@ -49,8 +62,12 @@
 # MAGIC `congestion_surcharge`/`airport_fee` exist (nulled where the source
 # MAGIC month didn't have them) for every row in the table.
 # MAGIC
-# MAGIC **Session 3.1b** adds derived columns, validity rules, and dedup.
-# MAGIC **Still no write to the silver container** — that's step 3.
+# MAGIC **Session 3.1b** confirmed healthy validity numbers: 38,310,226
+# MAGIC bronze rows → 37,853,023 valid, 433,095 rejected (1.13% reject rate),
+# MAGIC ~24,108 dedup removals.
+# MAGIC
+# MAGIC **Session 3.1c** writes `valid_df`/`rejected_df` to the silver
+# MAGIC container as Delta and registers `silver_tlc_deliveries`.
 
 # COMMAND ----------
 
@@ -189,3 +206,43 @@ print(f"Bronze row count:   {bronze_row_count:,}")
 print(f"Valid row count:    {valid_row_count:,}")
 print(f"Rejected row count: {rejected_row_count:,}")
 print(f"Reject rate:        {reject_rate_pct:.4f}%")
+
+# COMMAND ----------
+
+# ── 10. Write valid_df → Delta (batch, overwrite, partitioned) ───────────────
+SILVER_TABLE_PATH = SILVER_PATH + "tlc_deliveries"
+
+(
+    valid_df.write
+        .format("delta")
+        .mode("overwrite")
+        .partitionBy("pickup_date")
+        .save(SILVER_TABLE_PATH)
+)
+
+# COMMAND ----------
+
+# ── 11. Write rejected_df → Delta (batch, overwrite, unpartitioned) ──────────
+# Kept for auditing/debugging, not for downstream consumption.
+SILVER_REJECTS_PATH = SILVER_PATH + "_rejects/tlc_deliveries"
+
+(
+    rejected_df.write
+        .format("delta")
+        .mode("overwrite")
+        .save(SILVER_REJECTS_PATH)
+)
+
+# COMMAND ----------
+
+# ── 12. Register silver_tlc_deliveries as a table ─────────────────────────────
+spark.sql(f"""
+    CREATE TABLE IF NOT EXISTS silver_tlc_deliveries
+    USING DELTA
+    LOCATION '{SILVER_TABLE_PATH}'
+""")
+
+# COMMAND ----------
+
+# ── 13. Confirm write ──────────────────────────────────────────────────────────
+print(f"Wrote {valid_row_count:,} rows to silver_tlc_deliveries at {SILVER_TABLE_PATH}")

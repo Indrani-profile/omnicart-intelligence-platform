@@ -1,6 +1,6 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # TLC Yellow Taxi — Bronze → Silver (Step 1: Read, Rename)
+# MAGIC # TLC Yellow Taxi — Bronze → Silver (Steps 1-2: Read, Rename, Validate, Dedup)
 # MAGIC
 # MAGIC | | |
 # MAGIC |---|---|
@@ -23,8 +23,20 @@
 # MAGIC    `_source_file`/`_ingested_at` (bronze audit columns) pass through
 # MAGIC    unchanged.
 # MAGIC 5. **Preview** — prints the bronze row count and displays a sample so
-# MAGIC    the renamed schema can be checked before validity rules are added
-# MAGIC    in the next step.
+# MAGIC    the renamed schema can be checked before validity rules are added.
+# MAGIC 6. **Derived columns** — `delivery_id` (a deterministic SHA-256 hash
+# MAGIC    of `vendor_id` + `pickup_ts` + `pickup_location_id` +
+# MAGIC    `dropoff_location_id`, so reruns are idempotent instead of a random
+# MAGIC    UUID), `trip_duration_minutes`, and `pickup_date`.
+# MAGIC 7. **Validity rules** — splits the dataframe into `valid_df` and
+# MAGIC    `rejected_df` (rejects are kept, not silently dropped) based on
+# MAGIC    non-null/ordered timestamps, trip duration and distance bounds,
+# MAGIC    non-negative fare, a sane passenger count, and non-null location
+# MAGIC    IDs.
+# MAGIC 8. **Deduplicate** — `valid_df` is deduplicated on `delivery_id`,
+# MAGIC    keeping the row with the most recent `_ingested_at` per group.
+# MAGIC 9. **Summary** — prints bronze row count, valid row count, rejected
+# MAGIC    row count, and reject rate, to sanity-check the validity rules.
 # MAGIC
 # MAGIC **Note (Session 3.1a retry)** — this is a rewrite against the
 # MAGIC reprocessed bronze table (38,310,226 rows, confirmed 0% nulls on
@@ -37,8 +49,8 @@
 # MAGIC `congestion_surcharge`/`airport_fee` exist (nulled where the source
 # MAGIC month didn't have them) for every row in the table.
 # MAGIC
-# MAGIC **This step only reads and renames.** No casting, null handling,
-# MAGIC dedup, or write to the silver container yet.
+# MAGIC **Session 3.1b** adds derived columns, validity rules, and dedup.
+# MAGIC **Still no write to the silver container** — that's step 3.
 
 # COMMAND ----------
 
@@ -98,3 +110,82 @@ for source_col, target_col in RENAME_MAP.items():
 # ── 5. Preview renamed schema ──────────────────────────────────────────────────
 print(f"Bronze row count: {bronze_df.count()}")
 display(silver_df.limit(20))
+
+# COMMAND ----------
+
+# ── 6. Derived columns ─────────────────────────────────────────────────────────
+# delivery_id is a deterministic SHA-256 hash of vendor_id + pickup_ts +
+# pickup_location_id + dropoff_location_id — not a random UUID — so
+# re-running this notebook on the same bronze data produces the same IDs
+# instead of minting new ones every run.
+silver_df = (
+    silver_df
+        .withColumn(
+            "delivery_id",
+            F.sha2(
+                F.concat_ws(
+                    "|",
+                    F.col("vendor_id").cast("string"),
+                    F.col("pickup_ts").cast("string"),
+                    F.col("pickup_location_id").cast("string"),
+                    F.col("dropoff_location_id").cast("string"),
+                ),
+                256,
+            ),
+        )
+        .withColumn(
+            "trip_duration_minutes",
+            (F.unix_timestamp("dropoff_ts") - F.unix_timestamp("pickup_ts")) / 60.0,
+        )
+        .withColumn("pickup_date", F.to_date("pickup_ts"))
+)
+
+# COMMAND ----------
+
+# ── 7. Validity rules — split into valid_df / rejected_df ────────────────────
+# Rejected rows are kept in rejected_df rather than filtered and dropped
+# silently, so they can be inspected/audited later.
+VALID_CONDITION = (
+    F.col("pickup_ts").isNotNull()
+    & F.col("dropoff_ts").isNotNull()
+    & (F.col("dropoff_ts") > F.col("pickup_ts"))
+    & F.col("trip_duration_minutes").between(0, 180)
+    & F.col("trip_distance_miles").between(0, 200)
+    & (F.col("fare_amount") >= 0)
+    & (F.col("passenger_count").isNull() | F.col("passenger_count").between(0, 9))
+    & F.col("pickup_location_id").isNotNull()
+    & F.col("dropoff_location_id").isNotNull()
+)
+
+flagged_df = silver_df.withColumn("_is_valid", VALID_CONDITION)
+valid_df = flagged_df.filter(F.col("_is_valid")).drop("_is_valid")
+rejected_df = flagged_df.filter(~F.col("_is_valid")).drop("_is_valid")
+
+# COMMAND ----------
+
+# ── 8. Deduplicate valid_df on delivery_id ────────────────────────────────────
+# Keeps the row with the most recent _ingested_at per delivery_id in case
+# of any overlap.
+from pyspark.sql.window import Window
+
+dedup_window = Window.partitionBy("delivery_id").orderBy(F.col("_ingested_at").desc())
+
+valid_df = (
+    valid_df
+        .withColumn("_dedup_rank", F.row_number().over(dedup_window))
+        .filter(F.col("_dedup_rank") == 1)
+        .drop("_dedup_rank")
+)
+
+# COMMAND ----------
+
+# ── 9. Summary ─────────────────────────────────────────────────────────────────
+bronze_row_count = bronze_df.count()
+valid_row_count = valid_df.count()
+rejected_row_count = rejected_df.count()
+reject_rate_pct = (rejected_row_count / bronze_row_count) * 100
+
+print(f"Bronze row count:   {bronze_row_count:,}")
+print(f"Valid row count:    {valid_row_count:,}")
+print(f"Rejected row count: {rejected_row_count:,}")
+print(f"Reject rate:        {reject_rate_pct:.4f}%")

@@ -7,7 +7,6 @@
 # MAGIC | **Source** | `abfss://bronze@omnicartdatalake.dfs.core.windows.net/bronze_tlc_deliveries/` |
 # MAGIC | **Target** | `abfss://silver@omnicartdatalake.dfs.core.windows.net/tlc_deliveries/` |
 # MAGIC | **Rejects** | `abfss://silver@omnicartdatalake.dfs.core.windows.net/_rejects/tlc_deliveries/` |
-# MAGIC | **Table** | `silver_tlc_deliveries` (Delta) |
 # MAGIC | **Runtime** | Databricks 17.3 / Spark 4.0 — Unity Catalog enabled |
 # MAGIC
 # MAGIC **Sections**
@@ -46,10 +45,7 @@
 # MAGIC     `SILVER_PATH + "_rejects/tlc_deliveries"` as Delta, batch
 # MAGIC     overwrite, unpartitioned — kept for auditing/debugging, not for
 # MAGIC     downstream consumption.
-# MAGIC 12. **Register table** — `CREATE TABLE IF NOT EXISTS
-# MAGIC     silver_tlc_deliveries USING DELTA LOCATION ...` against the
-# MAGIC     valid-data path.
-# MAGIC 13. **Confirm** — prints the row count written to `silver_tlc_deliveries`.
+# MAGIC 12. **Confirm** — prints the row count written to the valid-data path.
 # MAGIC
 # MAGIC **Note (Session 3.1a retry)** — this is a rewrite against the
 # MAGIC reprocessed bronze table (38,310,226 rows, confirmed 0% nulls on
@@ -67,7 +63,9 @@
 # MAGIC ~24,108 dedup removals.
 # MAGIC
 # MAGIC **Session 3.1c** writes `valid_df`/`rejected_df` to the silver
-# MAGIC container as Delta and registers `silver_tlc_deliveries`.
+# MAGIC container as Delta, path-based only (no Unity Catalog table
+# MAGIC registration — the managed identity lacks Read/List/Write on the
+# MAGIC silver External Location; needs an Azure RBAC fix, deferred for now).
 
 # COMMAND ----------
 
@@ -235,14 +233,5 @@ SILVER_REJECTS_PATH = SILVER_PATH + "_rejects/tlc_deliveries"
 
 # COMMAND ----------
 
-# ── 12. Register silver_tlc_deliveries as a table ─────────────────────────────
-spark.sql(f"""
-    CREATE TABLE IF NOT EXISTS silver_tlc_deliveries
-    USING DELTA
-    LOCATION '{SILVER_TABLE_PATH}'
-""")
-
-# COMMAND ----------
-
-# ── 13. Confirm write ──────────────────────────────────────────────────────────
-print(f"Wrote {valid_row_count:,} rows to silver_tlc_deliveries at {SILVER_TABLE_PATH}")
+# ── 12. Confirm write ──────────────────────────────────────────────────────────
+print(f"Wrote {valid_row_count:,} rows to {SILVER_TABLE_PATH}")

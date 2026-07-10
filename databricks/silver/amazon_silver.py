@@ -1,10 +1,12 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Amazon Reviews — Bronze → Silver (Read, Rescued-Data Check, Rename, Parse)
+# MAGIC # Amazon Reviews — Bronze → Silver (Read, Rename, Validate, Dedup, Write)
 # MAGIC
 # MAGIC | | |
 # MAGIC |---|---|
 # MAGIC | **Source** | `abfss://bronze@omnicartdatalake.dfs.core.windows.net/bronze_amazon_reviews/` |
+# MAGIC | **Target** | `abfss://silver@omnicartdatalake.dfs.core.windows.net/amazon_reviews/` |
+# MAGIC | **Rejects** | `abfss://silver@omnicartdatalake.dfs.core.windows.net/_rejects/amazon_reviews/` |
 # MAGIC | **Runtime** | Databricks 17.3 / Spark 4.0 — Unity Catalog enabled |
 # MAGIC
 # MAGIC **Sections**
@@ -37,6 +39,35 @@
 # MAGIC     `images` array is kept, not dropped.
 # MAGIC 11. **Preview parsed schema** — prints the bronze row count and
 # MAGIC     displays a sample of the renamed/parsed dataframe.
+# MAGIC 12. **Derived columns** — `review_id` (a deterministic SHA-256 hash of
+# MAGIC     `asin` + `user_id` + `review_ts`, so reruns are idempotent instead
+# MAGIC     of a random UUID — matching `delivery_id` in `tlc_silver.py`) and
+# MAGIC     `category` (parsed from `_source_file`, since each of the 5 source
+# MAGIC     categories was ingested as its own `.jsonl` file — see
+# MAGIC     `ingestion/download_amazon.py`).
+# MAGIC 13. **Validity rules** — splits the dataframe into `valid_df` and
+# MAGIC     `rejected_df` (rejects are kept, not silently dropped) based on
+# MAGIC     non-null `asin`/`user_id`/`review_ts`, `rating` within Amazon's
+# MAGIC     1–5 scale, and non-null `text` (an empty-string review is still
+# MAGIC     valid — only a missing one is rejected).
+# MAGIC 14. **Deduplicate** — `valid_df` is deduplicated on `review_id`,
+# MAGIC     keeping the row with the most recent `_ingested_at` per group.
+# MAGIC 15. **Summary** — prints bronze row count, valid row count, rejected
+# MAGIC     row count, and reject rate.
+# MAGIC 16. **Write valid** — writes `valid_df` to
+# MAGIC     `SILVER_PATH + "amazon_reviews"` as Delta, batch overwrite,
+# MAGIC     partitioned by `category` (5 values, derived in step 12 — a
+# MAGIC     natural low-cardinality partition key here since the source data
+# MAGIC     is already split one file per category, unlike TLC where the
+# MAGIC     partition key is the business date column instead).
+# MAGIC 17. **Write rejects** — writes `rejected_df` to
+# MAGIC     `SILVER_PATH + "_rejects/amazon_reviews"` as Delta, batch
+# MAGIC     overwrite, unpartitioned.
+# MAGIC 18. **Confirm** — prints the row count written to the valid-data path.
+# MAGIC     No Unity Catalog table registration, matching the deferred,
+# MAGIC     path-based-only approach in `tlc_silver.py` (Session 3.1c) — the
+# MAGIC     managed identity still lacks Read/List/Write on the silver
+# MAGIC     External Location.
 # MAGIC
 # MAGIC **Note (Session 3.2a)** — this is read-only inspection. Given how many
 # MAGIC assumptions about TLC's bronze schema turned out wrong in Session 2.3
@@ -60,6 +91,12 @@
 # MAGIC Loader rather than per-file physical Parquet types. This step adds the
 # MAGIC `_rescued_data` check, rename, `review_ts` conversion, and images
 # MAGIC parsing.
+# MAGIC
+# MAGIC **Session 3.2c** verified step 2 clean (`_rescued_data` 0%, `review_ts`
+# MAGIC shows correct 2014–2022 dates with no epoch-zero artifacts,
+# MAGIC `image_count`/`primary_image_url` populated only where images exist)
+# MAGIC and adds `review_id`/`category` derived columns, validity rules,
+# MAGIC dedup, and the write to `silver`.
 
 # COMMAND ----------
 
@@ -178,3 +215,116 @@ silver_df = (
 # ── 11. Preview renamed/parsed schema ──────────────────────────────────────────
 print(f"Bronze row count: {bronze_row_count:,}")
 display(silver_df.limit(20))
+
+# COMMAND ----------
+
+# ── 12. Derived columns ────────────────────────────────────────────────────────
+# review_id is a deterministic SHA-256 hash of asin + user_id + review_ts —
+# not a random UUID — so re-running this notebook on the same bronze data
+# produces the same IDs instead of minting new ones every run (matching the
+# delivery_id pattern in tlc_silver.py).
+#
+# category is parsed from _source_file rather than assumed: each of the 5
+# source categories was downloaded and uploaded as its own .jsonl file (see
+# ingestion/download_amazon.py), so the file's base name is the category.
+silver_df = (
+    silver_df
+        .withColumn(
+            "review_id",
+            F.sha2(
+                F.concat_ws(
+                    "|",
+                    F.col("asin").cast("string"),
+                    F.col("user_id").cast("string"),
+                    F.col("review_ts").cast("string"),
+                ),
+                256,
+            ),
+        )
+        .withColumn(
+            "category",
+            F.regexp_extract(F.col("_source_file"), r"([^/]+)\.jsonl$", 1),
+        )
+)
+
+# COMMAND ----------
+
+# ── 13. Validity rules — split into valid_df / rejected_df ───────────────────
+# Rejected rows are kept in rejected_df rather than filtered and dropped
+# silently, so they can be inspected/audited later.
+VALID_CONDITION = (
+    F.col("asin").isNotNull()
+    & F.col("user_id").isNotNull()
+    & F.col("rating").between(1, 5)
+    & F.col("review_ts").isNotNull()
+    & F.col("text").isNotNull()
+)
+
+flagged_df = silver_df.withColumn("_is_valid", VALID_CONDITION)
+valid_df = flagged_df.filter(F.col("_is_valid")).drop("_is_valid")
+rejected_df = flagged_df.filter(~F.col("_is_valid")).drop("_is_valid")
+
+# COMMAND ----------
+
+# ── 14. Deduplicate valid_df on review_id ─────────────────────────────────────
+# Keeps the row with the most recent _ingested_at per review_id in case of
+# any overlap.
+from pyspark.sql.window import Window
+
+dedup_window = Window.partitionBy("review_id").orderBy(F.col("_ingested_at").desc())
+
+valid_df = (
+    valid_df
+        .withColumn("_dedup_rank", F.row_number().over(dedup_window))
+        .filter(F.col("_dedup_rank") == 1)
+        .drop("_dedup_rank")
+)
+
+# COMMAND ----------
+
+# ── 15. Summary ─────────────────────────────────────────────────────────────────
+valid_row_count = valid_df.count()
+rejected_row_count = rejected_df.count()
+reject_rate_pct = (rejected_row_count / bronze_row_count) * 100
+
+print(f"Bronze row count:   {bronze_row_count:,}")
+print(f"Valid row count:    {valid_row_count:,}")
+print(f"Rejected row count: {rejected_row_count:,}")
+print(f"Reject rate:        {reject_rate_pct:.4f}%")
+
+# COMMAND ----------
+
+# ── 16. Write valid_df → Delta (batch, overwrite, partitioned by category) ───
+# category is a natural low-cardinality (5-value) partition key here, since
+# the source data already arrives one file per category — unlike TLC, where
+# the partition key is a business date column instead.
+SILVER_TABLE_PATH = SILVER_PATH + "amazon_reviews"
+
+(
+    valid_df.write
+        .format("delta")
+        .mode("overwrite")
+        .partitionBy("category")
+        .save(SILVER_TABLE_PATH)
+)
+
+# COMMAND ----------
+
+# ── 17. Write rejected_df → Delta (batch, overwrite, unpartitioned) ──────────
+# Kept for auditing/debugging, not for downstream consumption.
+SILVER_REJECTS_PATH = SILVER_PATH + "_rejects/amazon_reviews"
+
+(
+    rejected_df.write
+        .format("delta")
+        .mode("overwrite")
+        .save(SILVER_REJECTS_PATH)
+)
+
+# COMMAND ----------
+
+# ── 18. Confirm write ─────────────────────────────────────────────────────────
+# No Unity Catalog table registration — path-based access only, matching the
+# deferred approach in tlc_silver.py (Session 3.1c): the managed identity
+# still lacks Read/List/Write on the silver External Location.
+print(f"Wrote {valid_row_count:,} rows to {SILVER_TABLE_PATH}")

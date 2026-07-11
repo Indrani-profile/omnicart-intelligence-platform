@@ -44,6 +44,21 @@
 # MAGIC 10. **Preview joined sample** — displays `pickup_ts`, `pickup_date`,
 # MAGIC     and the weather columns together so the date alignment can be
 # MAGIC     checked visually.
+# MAGIC 11. **Diagnostic — null-weather dates** — prints the distinct
+# MAGIC     `pickup_date` values among the rows where `temp_max_c` is null, to
+# MAGIC     confirm whether the 71 unmatched rows are a boundary/edge case
+# MAGIC     (dates outside 2023) or something worth investigating further.
+# MAGIC     Diagnostic only — not part of the write.
+# MAGIC 12. **Write** — writes `joined_df` to
+# MAGIC     `SILVER_PATH + "tlc_deliveries_weather"` as Delta, batch
+# MAGIC     overwrite, partitioned by `pickup_date` (matching
+# MAGIC     `tlc_deliveries`' own partitioning, since this enriches that same
+# MAGIC     table).
+# MAGIC 13. **Confirm** — prints the row count written and the path. No
+# MAGIC     Unity Catalog table registration, matching the deferred,
+# MAGIC     path-based-only approach used for the other silver tables — the
+# MAGIC     managed identity still lacks Read/List/Write on the silver
+# MAGIC     External Location.
 # MAGIC
 # MAGIC **Note (Session 3.3a)** — this step only fetches and shapes the
 # MAGIC weather data in isolation; it does not read `silver_tlc_deliveries` or
@@ -53,6 +68,12 @@
 # MAGIC **Session 3.3b** confirmed step 1 clean (365 rows, one per day of
 # MAGIC 2023, sensible NYC values) and adds the read + LEFT join against
 # MAGIC `silver_tlc_deliveries`. Still no write — that's step 3.
+# MAGIC
+# MAGIC **Session 3.3c** confirmed step 2 clean (37,853,023 joined rows,
+# MAGIC exact match with TLC silver; only 71 rows / 0.0002% with null
+# MAGIC `temp_max_c`; preview showed weather correctly aligned by date) and
+# MAGIC adds the null-weather-date diagnostic and the write to
+# MAGIC `tlc_deliveries_weather`.
 
 # COMMAND ----------
 
@@ -211,3 +232,48 @@ display(
         "windspeed_max_kmh",
     ).limit(20)
 )
+
+# COMMAND ----------
+
+# ── 11. Diagnostic — distinct pickup_date values with null temp_max_c ───────
+# Confirms whether the 71 unmatched rows are a boundary/edge case (dates
+# outside 2023) or something worth digging into further. Diagnostic only —
+# not part of the write below.
+null_weather_dates = [
+    row["pickup_date"]
+    for row in (
+        joined_df
+            .filter(F.col("temp_max_c").isNull())
+            .select("pickup_date")
+            .distinct()
+            .orderBy("pickup_date")
+            .collect()
+    )
+]
+
+print(f"Distinct pickup_date values with null temp_max_c ({len(null_weather_dates)}):")
+for null_date in null_weather_dates:
+    print(f"  - {null_date}")
+
+# COMMAND ----------
+
+# ── 12. Write joined_df → Delta (batch, overwrite, partitioned) ──────────────
+# Partitioned by pickup_date to match tlc_deliveries' own partitioning, since
+# this enriches that same table.
+SILVER_ENRICHED_PATH = SILVER_PATH + "tlc_deliveries_weather"
+
+(
+    joined_df.write
+        .format("delta")
+        .mode("overwrite")
+        .partitionBy("pickup_date")
+        .save(SILVER_ENRICHED_PATH)
+)
+
+# COMMAND ----------
+
+# ── 13. Confirm write ─────────────────────────────────────────────────────────
+# No Unity Catalog table registration — path-based access only, matching the
+# deferred approach used for the other silver tables: the managed identity
+# still lacks Read/List/Write on the silver External Location.
+print(f"Wrote {joined_row_count:,} rows to {SILVER_ENRICHED_PATH}")

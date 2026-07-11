@@ -54,11 +54,14 @@
 # MAGIC     overwrite, partitioned by `pickup_date` (matching
 # MAGIC     `tlc_deliveries`' own partitioning, since this enriches that same
 # MAGIC     table).
-# MAGIC 13. **Confirm** — prints the row count written and the path. No
-# MAGIC     Unity Catalog table registration, matching the deferred,
-# MAGIC     path-based-only approach used for the other silver tables — the
-# MAGIC     managed identity still lacks Read/List/Write on the silver
-# MAGIC     External Location.
+# MAGIC 13. **Confirm** — hardcodes the ABFSS path and re-reads the written
+# MAGIC     Delta table from disk to get the row count, rather than reusing
+# MAGIC     any variable from earlier cells, so this confirmation can be
+# MAGIC     re-run independently regardless of session/kernel state (see
+# MAGIC     Session 3.3c fix note below). No Unity Catalog table
+# MAGIC     registration, matching the deferred, path-based-only approach
+# MAGIC     used for the other silver tables — the managed identity still
+# MAGIC     lacks Read/List/Write on the silver External Location.
 # MAGIC
 # MAGIC **Note (Session 3.3a)** — this step only fetches and shapes the
 # MAGIC weather data in isolation; it does not read `silver_tlc_deliveries` or
@@ -74,6 +77,15 @@
 # MAGIC `temp_max_c`; preview showed weather correctly aligned by date) and
 # MAGIC adds the null-weather-date diagnostic and the write to
 # MAGIC `tlc_deliveries_weather`.
+# MAGIC
+# MAGIC **Session 3.3c fix** — the notebook's Python session had lost all
+# MAGIC state from earlier cells by the time section 13 ran (not just
+# MAGIC `joined_df`/`joined_row_count`, but even `SILVER_ENRICHED_PATH`
+# MAGIC itself was undefined). The write itself was unaffected — a fresh
+# MAGIC disk read independently confirmed 37,853,023 rows at the target
+# MAGIC path — but section 13 is now fully self-contained: it hardcodes the
+# MAGIC ABFSS path and re-reads the table from disk for the row count,
+# MAGIC rather than depending on any variable set by an earlier cell.
 
 # COMMAND ----------
 
@@ -273,7 +285,14 @@ SILVER_ENRICHED_PATH = SILVER_PATH + "tlc_deliveries_weather"
 # COMMAND ----------
 
 # ── 13. Confirm write ─────────────────────────────────────────────────────────
-# No Unity Catalog table registration — path-based access only, matching the
-# deferred approach used for the other silver tables: the managed identity
-# still lacks Read/List/Write on the silver External Location.
-print(f"Wrote {joined_row_count:,} rows to {SILVER_ENRICHED_PATH}")
+# Fully self-contained: hardcodes the path and re-reads the written Delta
+# table from disk rather than depending on any variable from earlier cells
+# (e.g. SILVER_ENRICHED_PATH, joined_row_count), so this confirmation can be
+# re-run on its own regardless of session/kernel state. No Unity Catalog
+# table registration — path-based access only, matching the deferred
+# approach used for the other silver tables: the managed identity still
+# lacks Read/List/Write on the silver External Location.
+CONFIRMED_PATH = "abfss://silver@omnicartdatalake.dfs.core.windows.net/tlc_deliveries_weather"
+written_row_count = spark.read.format("delta").load(CONFIRMED_PATH).count()
+
+print(f"Wrote {written_row_count:,} rows to {CONFIRMED_PATH}")

@@ -1,18 +1,29 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Daily Delivery Summary — Gold (Build & Preview, No Write Yet)
+# MAGIC # Daily Delivery Summary — Gold
 # MAGIC
 # MAGIC | | |
 # MAGIC |---|---|
-# MAGIC | **Source** | `SILVER_PATH + "tlc_deliveries_weather"` (Session 3.3c, validated Session 3.4) |
-# MAGIC | **Target** | none yet — this step only builds and eyeballs the aggregate |
+# MAGIC | **Source** | `omnicart_databricks.silver.tlc_deliveries_weather` (Session 3.3c, validated Session 3.4) |
+# MAGIC | **Target** | `omnicart_databricks.gold.daily_delivery_summary` |
 # MAGIC | **Runtime** | Databricks 17.3 / Spark 4.0 — Unity Catalog enabled |
 # MAGIC
 # MAGIC **Sections**
 # MAGIC
-# MAGIC 1. **Auth** — same Key Vault pattern as the silver notebooks.
-# MAGIC 2. **Read** — loads `tlc_deliveries_weather` (trip + weather already
-# MAGIC    joined in Session 3.3c, so no join is needed here).
+# MAGIC 1. **Read** — loads `tlc_deliveries_weather` via its Unity Catalog table
+# MAGIC    name (trip + weather already joined in Session 3.3c, so no join is
+# MAGIC    needed here). Read via `spark.read.table(...)` rather than a raw
+# MAGIC    `abfss://` path — direct-path reads on this workspace resolve to a
+# MAGIC    restricted workspace-default storage credential regardless of
+# MAGIC    External Location grants, so catalog-qualified table reads are used
+# MAGIC    everywhere instead (see Session 4.x infra notes).
+# MAGIC 2. **Filter to calendar year 2023** — a small number of source rows
+# MAGIC    (71, ~0.0002%) carry corrupted `pickup_ts` values from years far
+# MAGIC    outside 2023 (e.g. 2001, 2009, 2022-12-31 spillover) that passed
+# MAGIC    Week 3's validity rules (duration/distance/fare/passenger-count
+# MAGIC    checks) but were never explicitly date-range-checked. These are
+# MAGIC    excluded here at the gold layer; worth adding as an explicit check
+# MAGIC    in `silver_validation.py` as a fast-follow.
 # MAGIC 3. **Aggregate by `pickup_date`** — `trip_count`, `avg_fare_amount`,
 # MAGIC    `avg_trip_distance_miles`, `avg_trip_duration_minutes`,
 # MAGIC    `total_revenue` (sum of `total_amount`), plus that date's
@@ -22,35 +33,33 @@
 # MAGIC    not an aggregation choice.
 # MAGIC 4. **Preview** — prints the row count (expect 365, one per day of
 # MAGIC    2023) and displays the full result.
-# MAGIC
-# MAGIC **Note (Session 4.1a)** — read-only build/preview step. No write to
-# MAGIC ADLS yet; partitioning/write strategy is designed in a later step of
-# MAGIC this session.
-
+# MAGIC 5. **Write** — writes the verified result to
+# MAGIC    `omnicart_databricks.gold.daily_delivery_summary` as a Unity
+# MAGIC    Catalog-managed Delta table.
 # COMMAND ----------
+# ── 1. Read tlc_deliveries_weather (Unity Catalog table) ──────────────────────
+# Trip and weather data are already joined (Session 3.3c) — no join needed.
+tlc_weather_df = spark.read.table("omnicart_databricks.silver.tlc_deliveries_weather")
+# COMMAND ----------
+# ── 2. Filter to calendar year 2023 ────────────────────────────────────────────
+from pyspark.sql import functions as F
 
-# ── 1. Auth ───────────────────────────────────────────────────────────────────
-spark.conf.set(
-    "fs.azure.account.key.omnicartdatalake.dfs.core.windows.net",
-    dbutils.secrets.get(scope="omnicart-kv", key="adls-account-key"),
+before_count = tlc_weather_df.count()
+
+tlc_weather_df = tlc_weather_df.filter(
+    (F.col("pickup_date") >= "2023-01-01") &
+    (F.col("pickup_date") <= "2023-12-31")
 )
 
+after_count = tlc_weather_df.count()
+print(f"Before filter: {before_count:,} rows")
+print(f"After filter: {after_count:,} rows")
+print(f"Filtered out: {before_count - after_count} rows with pickup_date outside 2023")
 # COMMAND ----------
-
-# ── 2. Read tlc_deliveries_weather (batch) ────────────────────────────────────
-# Trip and weather data are already joined (Session 3.3c) — no join needed.
-SILVER_PATH = "abfss://silver@omnicartdatalake.dfs.core.windows.net/"
-
-tlc_weather_df = spark.read.format("delta").load(SILVER_PATH + "tlc_deliveries_weather")
-
-# COMMAND ----------
-
 # ── 3. Aggregate by pickup_date ────────────────────────────────────────────────
 # temp_max_c/temp_min_c/precipitation_mm/snowfall_cm are already constant per
 # pickup_date from the weather join in Session 3.3c — first() here is just
 # deduplicating that repeated value, not making an aggregation choice.
-from pyspark.sql import functions as F
-
 daily_summary_df = (
     tlc_weather_df
         .groupBy("pickup_date")
@@ -67,11 +76,17 @@ daily_summary_df = (
         )
         .orderBy("pickup_date")
 )
-
 # COMMAND ----------
-
 # ── 4. Preview ─────────────────────────────────────────────────────────────────
 daily_summary_row_count = daily_summary_df.count()
 print(f"Daily summary row count: {daily_summary_row_count:,} (expected 365)")
-
 display(daily_summary_df)
+# COMMAND ----------
+# ── 5. Write to Gold (registered in Unity Catalog) ─────────────────────────────
+spark.sql("CREATE SCHEMA IF NOT EXISTS omnicart_databricks.gold")
+
+daily_summary_df.write.format("delta").mode("overwrite").saveAsTable(
+    "omnicart_databricks.gold.daily_delivery_summary"
+)
+
+print("Write complete: omnicart_databricks.gold.daily_delivery_summary")

@@ -1,5 +1,5 @@
 -- ============================================================================
--- OmniCart — Snowflake Cross-Cloud Setup (Weeks 5-6, Session 5.1)
+-- OmniCart — Snowflake Cross-Cloud Setup (Weeks 5-6, Session 5.1-5.2)
 -- ============================================================================
 -- Snowflake account DDHCMGT-IY64615 runs on AWS (us-east-2), while the
 -- lakehouse (ADLS Gen2, omnicartdatalake) lives on Azure. This script wires
@@ -65,9 +65,11 @@ LIST @omnicart_gold_stage/daily_delivery_summary/;
 -- ── 4. External tables ──────────────────────────────────────────────────────
 -- Snowflake external tables on Parquet default to a single VARIANT column
 -- (VALUE) unless columns are explicitly typed via VALUE:field::TYPE
--- expressions, as done below.
+-- expressions, as done below. All five tables below are VERIFIED against
+-- real exported data (raw-VALUE-peek method: temporarily create without
+-- typed columns, SELECT VALUE LIMIT 5, inspect actual field names, then
+-- define the typed version to match).
 
--- Confirmed working / verified against real exported data:
 CREATE OR REPLACE EXTERNAL TABLE ext_daily_delivery_summary (
     pickup_date                DATE   AS (VALUE:pickup_date::DATE),
     trip_count                 NUMBER AS (VALUE:trip_count::NUMBER),
@@ -84,38 +86,44 @@ CREATE OR REPLACE EXTERNAL TABLE ext_daily_delivery_summary (
   FILE_FORMAT = (TYPE = PARQUET)
   AUTO_REFRESH = FALSE;
 
--- NOTE: the four tables below use INFERRED column names/types (from
--- Session 4.1's written descriptions of each Gold table), NOT verified
--- against a raw-VALUE peek the way ext_daily_delivery_summary was. Before
--- relying on these in dbt models, query the raw VALUE column on each
--- (e.g. temporarily create without typed columns and SELECT VALUE LIMIT 5)
--- to confirm actual field names, then correct any mismatches here.
-
+-- CORRECTED from Session 5.1 guess: no distance_tier field exists; real
+-- fields are total_trips/on_time_trips/delayed_trips/on_time_rate
+-- (avg_delay_minutes only present on rows with delayed_trips > 0).
 CREATE OR REPLACE EXTERNAL TABLE ext_delivery_sla (
-    pickup_date          DATE    AS (VALUE:pickup_date::DATE),
-    pickup_location_id   NUMBER  AS (VALUE:pickup_location_id::NUMBER),
-    distance_tier        VARCHAR AS (VALUE:distance_tier::VARCHAR),
-    is_on_time           BOOLEAN AS (VALUE:is_on_time::BOOLEAN),
-    trip_count           NUMBER  AS (VALUE:trip_count::NUMBER)
+    pickup_date          DATE   AS (VALUE:pickup_date::DATE),
+    pickup_location_id   NUMBER AS (VALUE:pickup_location_id::NUMBER),
+    total_trips          NUMBER AS (VALUE:total_trips::NUMBER),
+    on_time_trips        NUMBER AS (VALUE:on_time_trips::NUMBER),
+    delayed_trips        NUMBER AS (VALUE:delayed_trips::NUMBER),
+    on_time_rate         FLOAT  AS (VALUE:on_time_rate::FLOAT),
+    avg_delay_minutes    FLOAT  AS (VALUE:avg_delay_minutes::FLOAT)
 )
   WITH LOCATION = @omnicart_gold_stage/delivery_sla/
   FILE_FORMAT = (TYPE = PARQUET)
   AUTO_REFRESH = FALSE;
 
+-- CORRECTED from Session 5.1 guess: same field pattern as delivery_sla
+-- (grouped by weather_severity instead of pickup_location_id), no
+-- pct_delayed field.
 CREATE OR REPLACE EXTERNAL TABLE ext_weather_delay_impact (
-    pickup_date        DATE    AS (VALUE:pickup_date::DATE),
-    weather_severity   VARCHAR AS (VALUE:weather_severity::VARCHAR),
-    trip_count         NUMBER  AS (VALUE:trip_count::NUMBER),
-    avg_delay_minutes  FLOAT   AS (VALUE:avg_delay_minutes::FLOAT),
-    pct_delayed        FLOAT   AS (VALUE:pct_delayed::FLOAT)
+    pickup_date         DATE    AS (VALUE:pickup_date::DATE),
+    weather_severity    VARCHAR AS (VALUE:weather_severity::VARCHAR),
+    total_trips         NUMBER  AS (VALUE:total_trips::NUMBER),
+    on_time_trips       NUMBER  AS (VALUE:on_time_trips::NUMBER),
+    delayed_trips       NUMBER  AS (VALUE:delayed_trips::NUMBER),
+    on_time_rate        FLOAT   AS (VALUE:on_time_rate::FLOAT),
+    avg_delay_minutes   FLOAT   AS (VALUE:avg_delay_minutes::FLOAT)
 )
   WITH LOCATION = @omnicart_gold_stage/weather_delay_impact/
   FILE_FORMAT = (TYPE = PARQUET)
   AUTO_REFRESH = FALSE;
 
+-- CORRECTED from Session 5.1 guess: review_month is a VARCHAR in
+-- "YYYY-MM" format (e.g. "1998-01"), not a DATE. Cast to a real date
+-- downstream in a dbt model if needed, e.g. TO_DATE(review_month || '-01').
 CREATE OR REPLACE EXTERNAL TABLE ext_review_summary (
     category                VARCHAR AS (VALUE:category::VARCHAR),
-    review_month            DATE    AS (VALUE:review_month::DATE),
+    review_month            VARCHAR AS (VALUE:review_month::VARCHAR),
     review_count            NUMBER  AS (VALUE:review_count::NUMBER),
     avg_rating              FLOAT   AS (VALUE:avg_rating::FLOAT),
     verified_purchase_pct   FLOAT   AS (VALUE:verified_purchase_pct::FLOAT)
@@ -124,6 +132,7 @@ CREATE OR REPLACE EXTERNAL TABLE ext_review_summary (
   FILE_FORMAT = (TYPE = PARQUET)
   AUTO_REFRESH = FALSE;
 
+-- Original Session 5.1 schema confirmed correct as-is.
 CREATE OR REPLACE EXTERNAL TABLE ext_order_status_current (
     order_id               VARCHAR       AS (VALUE:order_id::VARCHAR),
     delivery_id            VARCHAR       AS (VALUE:delivery_id::VARCHAR),

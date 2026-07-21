@@ -1,0 +1,29 @@
+version: 2
+
+models:
+  - name: mart_weather_delay_correlation
+    description: >
+      Answers the project's core cross-domain question: does weather affect
+      delivery delays? Finding: correlation coefficients between weather
+      metrics (precipitation, snowfall) and delay outcomes are all near zero
+      (-0.04 to +0.11), and severe-weather days (Snow, Rain, Extreme Cold)
+      show slightly BETTER on-time rates than Clear days, not worse.
+
+      This is counterintuitive but plausible: weather forecasts are known in
+      advance, so operations likely proactively adjust staffing/routing on
+      known-bad-weather days, offsetting or overcorrecting the raw physical
+      slowdown. Extreme Cold's sample (3 days) is too small to draw strong
+      conclusions from on its own — flagged as low-confidence.
+    columns:
+      - name: weather_severity
+        description: One of Clear, Rain, Snow, Extreme Cold
+      - name: day_count
+        description: Number of days in this severity tier (Extreme Cold = 3, low confidence)
+      - name: delay_lift_vs_clear_minutes
+        description: Difference in avg delay minutes vs. the Clear-day baseline (negative = better than Clear)
+      - name: on_time_rate_delta_vs_clear
+        description: Difference in on-time rate (percentage points) vs. the Clear-day baseline
+      - name: corr_precipitation_delay
+        description: Pearson correlation between precipitation_mm and avg_delay_minutes across all days
+      - name: corr_snowfall_delay
+        description: Pearson correlation between snowfall_cm and avg_delay_minutes across all days

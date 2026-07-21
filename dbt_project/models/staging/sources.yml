@@ -1,0 +1,85 @@
+version: 2
+
+sources:
+  - name: gold
+    database: OMNICART_DB
+    schema: GOLD
+    tables:
+      - name: ext_daily_delivery_summary
+        description: >
+          Daily aggregated delivery metrics joined with weather data.
+          365 rows, one per calendar day of 2023. Verified against
+          Databricks Gold layer (Session 4.1/5.2).
+        columns:
+          - name: pickup_date
+            description: Calendar date of pickup (2023 only)
+          - name: trip_count
+          - name: avg_fare_amount
+          - name: total_revenue
+          - name: avg_trip_distance_miles
+          - name: avg_trip_duration_minutes
+          - name: precipitation_mm
+          - name: snowfall_cm
+          - name: temp_max_c
+          - name: temp_min_c
+
+      - name: ext_delivery_sla
+        description: >
+          Daily on-time/delayed trip breakdown by pickup location.
+          80,752 rows. Verified against Databricks Gold layer (Session 5.2);
+          field names corrected from initial inferred schema.
+        columns:
+          - name: pickup_date
+          - name: pickup_location_id
+          - name: total_trips
+          - name: on_time_trips
+          - name: delayed_trips
+          - name: on_time_rate
+          - name: avg_delay_minutes
+            description: Only populated on rows with delayed_trips > 0
+
+      - name: ext_weather_delay_impact
+        description: >
+          Daily on-time/delayed trip breakdown by weather severity tier.
+          365 rows. Verified against Databricks Gold layer (Session 5.2);
+          field names corrected from initial inferred schema.
+        columns:
+          - name: pickup_date
+          - name: weather_severity
+          - name: total_trips
+          - name: on_time_trips
+          - name: delayed_trips
+          - name: on_time_rate
+          - name: avg_delay_minutes
+
+      - name: ext_review_summary
+        description: >
+          Review stats by category and month. 1,456 rows. Verified against
+          Databricks Gold layer (Session 5.2); review_month confirmed as
+          VARCHAR 'YYYY-MM' format, not DATE, correcting initial guess.
+        columns:
+          - name: category
+          - name: review_month
+            description: "Format: 'YYYY-MM' string, e.g. '1998-01'"
+          - name: review_count
+          - name: avg_rating
+          - name: verified_purchase_pct
+            description: >
+              0% pre-2011 is expected/correct (Verified Purchase badge
+              didn't exist until ~2011-2015), not a data quality issue.
+
+      - name: ext_order_status_current
+        description: >
+          One row per order, current lifecycle status from the Session 4.3
+          streaming pipeline. 250 rows. Verified against Databricks Gold
+          layer (Session 5.2); original schema guess was correct as-is.
+        columns:
+          - name: order_id
+          - name: delivery_id
+          - name: pickup_location_id
+          - name: vendor_id
+          - name: order_value
+          - name: current_status
+            description: "'delivered' or 'cancelled'"
+          - name: last_event_timestamp
+          - name: updated_at

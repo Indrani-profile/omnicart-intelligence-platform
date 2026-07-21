@@ -185,7 +185,7 @@ def write_bronze_batch(batch_df, batch_id):
 from pyspark.sql import Window
 
 def write_gold_batch(batch_df, batch_id):
-    if batch_df.rdd.isEmpty():
+    if batch_df.isEmpty():
         print(f"[gold] batch {batch_id}: empty, skipping")
         return
 

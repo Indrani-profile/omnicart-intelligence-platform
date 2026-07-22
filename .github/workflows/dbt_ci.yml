@@ -63,6 +63,8 @@ jobs:
     needs: dbt-test
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     defaults:
       run:
         working-directory: dbt_project

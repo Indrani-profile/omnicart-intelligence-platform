@@ -58,3 +58,70 @@ jobs:
 
       - name: Run dbt tests
         run: dbt test
+
+  deploy-docs:
+    needs: dbt-test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dbt_project
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dbt
+        run: pip install dbt-snowflake==1.11.5
+
+      - name: Create profiles.yml
+        run: |
+          mkdir -p ~/.dbt
+          cat > ~/.dbt/profiles.yml << EOF
+          omnicart:
+            target: ci
+            outputs:
+              ci:
+                type: snowflake
+                account: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+                user: ${{ secrets.SNOWFLAKE_USER }}
+                private_key: |
+          $(echo "${{ secrets.SNOWFLAKE_PRIVATE_KEY }}" | sed 's/^/          /')
+                authenticator: snowflake_jwt
+                role: ACCOUNTADMIN
+                database: OMNICART_DB
+                warehouse: COMPUTE_WH
+                schema: dbt_ci
+                threads: 4
+          EOF
+
+      - name: Install dbt packages
+        run: dbt deps
+
+      - name: Generate docs
+        run: dbt docs generate
+
+      - name: Copy docs to repo
+        run: |
+          cp target/index.html ../docs/dbt/index.html
+          cp target/catalog.json ../docs/dbt/catalog.json
+          cp target/manifest.json ../docs/dbt/manifest.json
+          cp target/run_results.json ../docs/dbt/run_results.json
+
+      - name: Commit and push updated docs
+        run: |
+          cd ..
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/dbt/
+          if git diff --staged --quiet; then
+            echo "No doc changes to commit"
+          else
+            git commit -m "Auto-update dbt docs [skip ci]"
+            git push
+          fi

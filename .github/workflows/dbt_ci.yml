@@ -1,0 +1,56 @@
+name: dbt CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'dbt_project/**'
+  pull_request:
+    paths:
+      - 'dbt_project/**'
+
+jobs:
+  dbt-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dbt_project
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dbt
+        run: |
+          pip install dbt-snowflake==1.11.5
+
+      - name: Create profiles.yml
+        run: |
+          mkdir -p ~/.dbt
+          cat > ~/.dbt/profiles.yml << EOF
+          omnicart:
+            target: ci
+            outputs:
+              ci:
+                type: snowflake
+                account: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+                user: ${{ secrets.SNOWFLAKE_USER }}
+                private_key: ${{ secrets.SNOWFLAKE_PRIVATE_KEY }}
+                authenticator: snowflake_jwt
+                role: ACCOUNTADMIN
+                database: OMNICART_DB
+                warehouse: COMPUTE_WH
+                schema: dbt_ci
+                threads: 4
+          EOF
+
+      - name: Install dbt packages
+        run: dbt deps
+
+      - name: Run dbt tests
+        run: dbt test

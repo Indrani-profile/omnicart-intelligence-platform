@@ -27,3 +27,44 @@ models:
         description: Pearson correlation between precipitation_mm and avg_delay_minutes across all days
       - name: corr_snowfall_delay
         description: Pearson correlation between snowfall_cm and avg_delay_minutes across all days
+
+  - name: mart_review_analytics
+    description: >
+      Trends review volume, rating, and verified-purchase mix by category
+      and year across the full 1998-2023 span. Confirms expected real-world
+      patterns: review volume grows from double digits in the late 1990s to
+      six figures by the 2010s (e-commerce growth curve), and
+      verified_purchase_pct climbs from ~0% (feature didn't exist yet) to
+      ~90%+ (matching the Session 4.1 finding that Verified Purchase wasn't
+      introduced until ~2011-2015). rating_delta_vs_lifetime_avg flags
+      whether a given category-year is over/under-performing that
+      category's own historical average, rather than comparing across
+      categories directly (categories differ too much in scale/nature for
+      a fair head-to-head comparison).
+    columns:
+      - name: category
+      - name: review_year
+      - name: review_count
+      - name: avg_rating
+      - name: lifetime_review_count
+        description: Constant across all years within a category; total historical review count
+      - name: rating_delta_vs_lifetime_avg
+        description: This year's avg_rating minus the category's all-time average rating
+
+  - name: mart_vendor_performance
+    description: >
+      Aggregates the 250 synthetic orders (Session 4.3 streaming pipeline)
+      by vendor: volume, delivered vs. cancelled rate, avg order value.
+      Only 2 vendors exist in this dataset (vendor_id 1 and 2), reflecting
+      the small fixed set used by the Session 4.2 event producer, not a
+      real multi-vendor marketplace. Both vendors show nearly identical
+      delivered/cancelled rates (~84%/16%) despite a ~3.5x difference in
+      volume (194 vs. 56 orders) — consistent with the cancellation
+      outcome being generated independently of vendor in the synthetic
+      data, rather than reflecting a genuine per-vendor quality signal.
+    columns:
+      - name: vendor_id
+      - name: total_orders
+      - name: delivered_rate
+      - name: cancelled_rate
+      - name: avg_order_value

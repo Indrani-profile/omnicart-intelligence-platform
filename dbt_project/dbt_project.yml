@@ -1,4 +1,4 @@
-# CI: GitHub Actions runs `dbt test` on every push/PR touching this folder (see .github/workflows/dbt_ci.yml)
+# CI: GitHub Actions runs `dbt test` on every push/PR touching this folder (see .github/workflows/dbt_ci.yml). Fixed profiles.yml generation in cd92e3a.
 name: 'omnicart'
 version: '1.0.0'
 config-version: 2

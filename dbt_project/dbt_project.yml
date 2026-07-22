@@ -1,3 +1,4 @@
+# CI: GitHub Actions runs `dbt test` on every push/PR touching this folder (see .github/workflows/dbt_ci.yml)
 name: 'omnicart'
 version: '1.0.0'
 config-version: 2

@@ -40,7 +40,8 @@ jobs:
                 type: snowflake
                 account: ${{ secrets.SNOWFLAKE_ACCOUNT }}
                 user: ${{ secrets.SNOWFLAKE_USER }}
-                private_key: ${{ secrets.SNOWFLAKE_PRIVATE_KEY }}
+                private_key: |
+          $(echo "${{ secrets.SNOWFLAKE_PRIVATE_KEY }}" | sed 's/^/          /')
                 authenticator: snowflake_jwt
                 role: ACCOUNTADMIN
                 database: OMNICART_DB

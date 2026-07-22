@@ -53,5 +53,8 @@ jobs:
       - name: Install dbt packages
         run: dbt deps
 
+      - name: Run dbt models
+        run: dbt run
+
       - name: Run dbt tests
         run: dbt test

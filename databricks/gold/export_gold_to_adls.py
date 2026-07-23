@@ -22,6 +22,7 @@ GOLD_TABLES = [
     "weather_delay_impact",
     "review_summary",
     "order_status_current",
+    "demand_forecast",
 ]
 
 EXPORT_BASE_PATH = "abfss://gold@omnicartdatalake.dfs.core.windows.net/exports"

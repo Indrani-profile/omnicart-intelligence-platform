@@ -38,7 +38,7 @@ def run_query(query):
 st.title("🛒 OmniCart Intelligence Dashboard")
 st.caption("Cross-cloud data lakehouse: Databricks → ADLS → Snowflake → dbt")
 
-tab1, tab2, tab3 = st.tabs(["🌦️ Weather & Delays", "⭐ Review Analytics", "🚚 Vendor Performance"])
+tab1, tab2, tab3, tab4 = st.tabs(["🌦️ Weather & Delays", "⭐ Review Analytics", "🚚 Vendor Performance", "📈 Demand Forecast"])
 
 with tab1:
     st.header("Does weather affect delivery delays?")
@@ -108,3 +108,47 @@ with tab3:
         "Note: only 2 vendors exist in this dataset (synthetic Session 4.3 data), "
         "reflecting the small fixed producer set rather than a real multi-vendor marketplace."
     )
+
+with tab4:
+    st.header("Demand Forecast: Daily Trip Volume")
+    df = run_query("SELECT * FROM mart_demand_forecast ORDER BY forecast_date")
+
+    fig = px.line(
+        df, x="forecast_date", y=["actual_trip_count", "predicted_trip_count"],
+        title="Actual vs. Predicted Daily Trip Count",
+    )
+    # Shade the confidence interval band using the upper/lower bound columns
+    fig.add_scatter(
+        x=df["forecast_date"], y=df["predicted_upper_bound"],
+        mode="lines", line=dict(width=0), showlegend=False, name="Upper bound",
+    )
+    fig.add_scatter(
+        x=df["forecast_date"], y=df["predicted_lower_bound"],
+        mode="lines", line=dict(width=0), fill="tonexty",
+        fillcolor="rgba(100,150,255,0.15)", showlegend=False, name="Lower bound",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    col1, col2 = st.columns(2)
+    col1.metric("Prophet MAPE (30-day holdout)", "23.04%")
+    col2.metric("Naive baseline MAPE (same-day-last-week)", "22.34%")
+
+    st.warning(
+        "**Finding:** Prophet does NOT beat the naive same-day-last-week baseline on this "
+        "series — indicating day-of-week is the dominant signal, and the added model "
+        "complexity isn't earning its keep here. A simple heuristic is the honest "
+        "recommendation for this specific series."
+    )
+
+    fig2 = px.line(
+        df[df['is_future'] == False], x="forecast_date", y="pct_error",
+        title="Forecast Error Over Time (historical days only)",
+    )
+    st.plotly_chart(fig2, use_container_width=True)
+    st.caption(
+        "Note: late-September 2023 shows a real data anomaly (trip_count collapsing to "
+        "~5-6% of typical volume for 4 days), producing pct_error spikes over 2000% in that "
+        "window — a genuine anomaly in the underlying data, not a forecasting bug."
+    )
+
+    st.dataframe(df, use_container_width=True)

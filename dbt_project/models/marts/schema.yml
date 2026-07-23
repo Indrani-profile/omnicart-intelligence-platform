@@ -68,3 +68,38 @@ models:
       - name: delivered_rate
       - name: cancelled_rate
       - name: avg_order_value
+
+  - name: mart_demand_forecast
+    description: >
+      Daily trip_count forecast via Prophet (weekly seasonality), 395 rows
+      (365 historical actuals + 30 genuinely future days). Validated
+      against a 30-day holdout: Prophet did NOT beat a naive
+      same-day-last-week baseline (23.04% MAPE vs 22.34%), indicating
+      day-of-week is the dominant signal in this series and the added
+      model complexity isn't earning its keep here — a real finding, not
+      a failed experiment.
+
+      pct_error is a per-day accuracy signal for historical rows (null for
+      future rows) so the dashboard can show accuracy trend over time
+      rather than just the single MAPE headline. No range test is applied
+      to pct_error: most days sit around 0-40%, but late-September 2023
+      (Sep 21-24) shows actual_trip_count collapsing to ~4,600-5,700
+      against Prophet's ~90,000-110,000 prediction, pushing pct_error as
+      high as 2,216% on 2023-09-22 — a genuine data anomaly in that
+      window, not a bug in this model, so an upper bound would be wrong
+      to enforce here.
+    columns:
+      - name: forecast_date
+      - name: actual_trip_count
+        description: Null for future (forecasted) dates
+      - name: predicted_trip_count
+      - name: predicted_lower_bound
+      - name: predicted_upper_bound
+      - name: is_future
+        description: TRUE for the 30 genuinely future forecasted days
+      - name: pct_error
+        description: >
+          abs(actual - predicted) / actual for historical rows; null for
+          future rows. Not range-tested — see model description for the
+          late-Sept 2023 anomaly that pushes this well past 100% on a few
+          real days.

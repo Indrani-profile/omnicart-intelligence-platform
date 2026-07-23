@@ -83,3 +83,21 @@ sources:
             description: "'delivered' or 'cancelled'"
           - name: last_event_timestamp
           - name: updated_at
+
+      - name: ext_demand_forecast
+        description: >
+          Daily trip_count forecast via Prophet (weekly seasonality), plus
+          365 days of historical actuals for comparison. Validated against
+          a 30-day holdout: Prophet did NOT beat a naive same-day-last-week
+          baseline (23.04% MAPE vs 22.34%), indicating day-of-week is the
+          dominant signal in this series. 395 rows (365 historical + 30
+          future). Verified against real exported data (Session 5.x).
+        columns:
+          - name: forecast_date
+          - name: actual_trip_count
+            description: Null for future (forecasted) dates
+          - name: predicted_trip_count
+          - name: predicted_lower_bound
+          - name: predicted_upper_bound
+          - name: is_future
+            description: TRUE for the 30 genuinely future forecasted days

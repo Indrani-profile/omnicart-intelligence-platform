@@ -147,6 +147,20 @@ CREATE OR REPLACE EXTERNAL TABLE ext_order_status_current (
   FILE_FORMAT = (TYPE = PARQUET)
   AUTO_REFRESH = FALSE;
 
+-- Sixth external table, added for demand forecasting (Session 5.x).
+-- Verified against real exported data via the raw-VALUE-peek method.
+CREATE OR REPLACE EXTERNAL TABLE ext_demand_forecast (
+    forecast_date            TIMESTAMP_NTZ AS (VALUE:forecast_date::TIMESTAMP_NTZ),
+    actual_trip_count        FLOAT         AS (VALUE:actual_trip_count::FLOAT),
+    predicted_trip_count     FLOAT         AS (VALUE:predicted_trip_count::FLOAT),
+    predicted_lower_bound    FLOAT         AS (VALUE:predicted_lower_bound::FLOAT),
+    predicted_upper_bound    FLOAT         AS (VALUE:predicted_upper_bound::FLOAT),
+    is_future                BOOLEAN       AS (VALUE:is_future::BOOLEAN)
+)
+  WITH LOCATION = @omnicart_gold_stage/demand_forecast/
+  FILE_FORMAT = (TYPE = PARQUET)
+  AUTO_REFRESH = FALSE;
+
 
 -- ── 5. Refresh pattern ───────────────────────────────────────────────────────
 -- AUTO_REFRESH is FALSE (Azure auto-refresh needs Event Grid integration,
@@ -158,3 +172,4 @@ CREATE OR REPLACE EXTERNAL TABLE ext_order_status_current (
 --   ALTER EXTERNAL TABLE ext_weather_delay_impact REFRESH;
 --   ALTER EXTERNAL TABLE ext_review_summary REFRESH;
 --   ALTER EXTERNAL TABLE ext_order_status_current REFRESH;
+--   ALTER EXTERNAL TABLE ext_demand_forecast REFRESH;

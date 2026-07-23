@@ -110,3 +110,21 @@ models:
               arguments:
                 min_value: 0
                 inclusive: true
+
+  - name: stg_gold__demand_forecast
+    description: Daily trip_count actuals and Prophet forecast, 395 rows (365 historical + 30 future).
+    columns:
+      - name: forecast_date
+        tests:
+          - unique
+          - not_null
+      - name: predicted_trip_count
+        tests:
+          - not_null
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                inclusive: true
+      - name: is_future
+        tests:
+          - not_null

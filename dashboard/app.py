@@ -6,7 +6,7 @@ from cryptography.hazmat.primitives import serialization
 
 st.set_page_config(page_title="OmniCart Intelligence Dashboard", layout="wide")
 
-@st.cache_resource
+@st.cache_resource(ttl=3000)
 def get_connection():
     private_key_pem = st.secrets["snowflake"]["private_key"].encode()
     p_key = serialization.load_pem_private_key(
@@ -26,12 +26,18 @@ def get_connection():
         warehouse="COMPUTE_WH",
         database="OMNICART_DB",
         schema="dbt_dev",
+        client_session_keep_alive=True,
     )
 
 @st.cache_data(ttl=3600)
 def run_query(query):
     conn = get_connection()
-    df = pd.read_sql(query, conn)
+    try:
+        df = pd.read_sql(query, conn)
+    except snowflake.connector.errors.Error:
+        get_connection.clear()
+        conn = get_connection()
+        df = pd.read_sql(query, conn)
     df.columns = [c.lower() for c in df.columns]
     return df
 
